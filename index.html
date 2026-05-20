@@ -67,7 +67,7 @@
       </label>
     </div>
     <div class="row">
-      <label>Data (Hex, séparés par espaces) :</label>
+      <label>Data (Hex) :</label>
       <input type="text" id="in-data" style="flex-grow: 1;" value="11 22 33 44">
       <button id="btn-send" disabled>Envoyer Message</button>
     </div>
@@ -94,7 +94,6 @@
     let port;
     let usbDevice;
     let writer;
-    let isWebUSBMode = false;
     const fixedTrace = {};
 
     const btnConnect = document.getElementById("btn-connect");
@@ -109,64 +108,58 @@
     const inDlc = document.getElementById("in-dlc");
     const inData = document.getElementById("in-data");
 
-    // --- ENREGISTREMENT DU SERVICE WORKER (POUR LE MODE HORS-LIGNE) ---
+    // Variables globales du parser CAN
+    let parserState = 0; 
+    let rxId = 0; 
+    let rxFlags = 0; 
+    let rxDlc = 0; 
+    let rxData = []; 
+    let byteCount = 0;
+
     if ('serviceWorker' in navigator) {
       window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js')
-          .then(reg => console.log('Service Worker enregistré !', reg.scope))
-          .catch(err => console.log('Échec enregistrement SW:', err));
+        navigator.serviceWorker.register('sw.js').catch(err => console.log(err));
       });
     }
 
-    // --- GESTION DU PLEIN ÉCRAN ---
     btnFullscreen.addEventListener("click", () => {
       if (!document.fullscreenElement) {
         document.documentElement.requestFullscreen()
           .then(() => { btnFullscreen.textContent = "❌ Quitter Plein Écran"; })
-          .catch(err => alert(`Erreur plein écran: ${err.message}`));
+          .catch(err => alert(`Erreur: ${err.message}`));
       } else {
         document.exitFullscreen();
         btnFullscreen.textContent = "📺 Plein Écran";
       }
     });
 
-    // --- GESTION DE LA CONNEXION (SERIAL OU USB BRUT) ---
     btnConnect.addEventListener("click", async () => {
-      // Si aucune API n'est dispo
       if (!("serial" in navigator) && !("usb" in navigator)) {
-        alert("Votre navigateur ne supporte pas les communications USB. Utilisez Chrome (PC) ou Kiwi Browser (Android).");
+        alert("Navigateur non compatible.");
         return;
       }
 
       try {
-        // Option A : Utilisation de la Web Serial API classique (PC/Mac/Edge/Chrome)
         if ("serial" in navigator) {
           port = await navigator.serial.requestPort();
           await port.open({ baudRate: 115200 });
           writer = port.writable.getWriter();
-          isWebUSBMode = false;
           
-          statusEl.textContent = "Connecté (Mode Serial) !";
+          statusEl.textContent = "Connecté (Mode Serial PC) !";
           statusEl.style.color = "green";
           btnSend.disabled = false;
           btnConnect.disabled = true;
           
           readLoopSerial();
         } 
-        // Option B : Secours en WebUSB direct pour Android (Kiwi Browser)
         else if ("usb" in navigator) {
-          // Filtre vide pour lister tous les périphériques USB connectés (dont le CH340)
           usbDevice = await navigator.usb.requestDevice({ filters: [] });
           await usbDevice.open();
           await usbDevice.selectConfiguration(1);
-          await usbDevice.claimInterface(0); // Revendique le contrôle du CH340
+          await usbDevice.claimInterface(0); 
           
-          isWebUSBMode = true;
-          
-          // Simulation de l'objet writer pour unifier le code d'envoi
           writer = {
             write: async (data) => {
-              // Endpoint 2 correspond généralement au canal OUT (TX) sur les puces CH340
               await usbDevice.transferOut(2, data);
             }
           };
@@ -184,12 +177,11 @@
       }
     });
 
-    // --- SCRIPT D'EMISSION ---
     btnSend.addEventListener("click", async () => {
       if (!writer) return;
       let idVal = parseInt(inId.value, 16) || 0;
       if (!chkExt.checked && idVal > 0x7FF) {
-        alert("En mode Standard, l'ID ne peut pas dépasser 7FF (Hex).");
+        alert("ID Standard max: 7FF.");
         return;
       }
       const dlcVal = parseInt(inDlc.value);
@@ -201,24 +193,19 @@
       }
 
       const flags = isFdVal ? 0x01 : 0x00;
-      
-      // Construction de la trame [SOF] [ID(4)] [FLAGS(1)] [DLC(1)] [DATA] [EOF]
       let frame = [0xAA, (idVal >> 24) & 0xFF, (idVal >> 16) & 0xFF, (idVal >> 8) & 0xFF, idVal & 0xFF, flags, dlcVal];
       frame = frame.concat(dataBytes);
       frame.push(0x55);
 
       try {
         await writer.write(new Uint8Array(frame));
-      } catch (e) { alert("Erreur d'envoi: " + e.message); }
+      } catch (e) { alert("Erreur: " + e.message); }
     });
 
-    // --- BOUCLE RECEPTION : MODE WEB SERIAL (PC) ---
     async function readLoopSerial() {
       let reader;
       try {
         reader = port.readable.getReader();
-        let state = 0; let rxId = 0; let rxFlags = 0; let rxDlc = 0; let rxData = []; let byteCount = 0;
-
         while (true) {
           const { value, done } = await reader.read();
           if (done) break;
@@ -227,23 +214,78 @@
       } catch (e) { console.error(e); } finally { if (reader) reader.releaseLock(); }
     }
 
-    // --- BOUCLE RECEPTION : MODE WEBUSB (ANDROID KIWI) ---
     async function readLoopWebUSB() {
-      let state = 0; let rxId = 0; let rxFlags = 0; let rxDlc = 0; let rxData = []; let byteCount = 0;
       try {
         while (true) {
-          // Endpoint 1 correspond généralement au canal IN (RX) sur les puces CH340
           const result = await usbDevice.transferIn(1, 64);
           if (result.status === 'ok') {
-            const value = new Uint8Array(result.data.buffer);
-            parseBytes(value);
+            parseBytes(new Uint8Array(result.data.buffer));
           }
           if (result.status === 'stall') {
             await usbDevice.clearHalt('in', 1);
           }
         }
-      } catch (e) { console.error("Erreur WebUSB de lecture:", e); }
+      } catch (e) { console.error(e); }
     }
 
-    // --- PARSER COMMUN DES OCTETS CAN ---
-    let state = 0; let rxId = 0; let rxFlags = 0; let rx
+    function parseBytes(value) {
+      for (let i = 0; i < value.length; i++) {
+        let b = value[i];
+        switch (parserState) {
+          case 0:
+            if (b === 0xAA) { parserState = 1; rxId = 0; byteCount = 0; } 
+            break;
+          case 1:
+            rxId = (rxId << 8) | b;
+            byteCount++; 
+            if (byteCount === 4) parserState = 2; 
+            break;
+          case 2:
+            rxFlags = b; 
+            parserState = 3; 
+            break;
+          case 3:
+            rxDlc = b; rxData = [];
+            let size = [0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64][rxDlc] || 64;
+            if (size > 0) { parserState = 4; byteCount = size; } else { parserState = 5; } 
+            break;
+          case 4:
+            rxData.push(b); byteCount--; 
+            if (byteCount === 0) parserState = 5; 
+            break;
+          case 5:
+            if (b === 0x55) handleReceivedMsg(rxId, rxFlags, rxDlc, rxData); 
+            parserState = 0; 
+            break;
+        }
+      }
+    }
+
+    function handleReceivedMsg(id, flags, dlc, data) {
+      const idKey = id.toString(16).toUpperCase().padStart(3, '0');
+      const dataHexStr = data.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(" ");
+      const isFd = (flags & 0x01) !== 0;
+
+      if (fixedTrace[idKey]) {
+        fixedTrace[idKey].count++; 
+        fixedTrace[idKey].dlc = dlc; 
+        fixedTrace[idKey].data = dataHexStr; 
+        fixedTrace[idKey].mode = isFd ? "FD" : "2.0";
+      } else {
+        fixedTrace[idKey] = { idStr: idKey, isExt: id > 0x7FF ? "EXT" : "STD", mode: isFd ? "FD" : "2.0", dlc: dlc, data: dataHexStr, count: 1 };
+      }
+      renderTrace();
+    }
+
+    function renderTrace() {
+      traceBody.innerHTML = "";
+      Object.keys(fixedTrace).sort().forEach(id => {
+        const item = fixedTrace[id];
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td><strong>0x${item.idStr}</strong></td><td>${item.isExt}</td><td><span style="color: ${item.mode === 'FD' ? '#0078D7' : '#555'}"><strong>${item.mode}</strong></span></td><td>${item.dlc}</td><td class="data-bytes">${item.data}</td><td class="count">${item.count}</td>`;
+        traceBody.appendChild(tr);
+      });
+    }
+  </script>
+</body>
+</html>
