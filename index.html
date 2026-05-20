@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>CAN FD Bridge PWA</title>
+  
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0078D7">
+  
+  <style>
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f4f9; margin: 0; padding: 20px; color: #333; }
+    .panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+    h2 { margin-top: 0; font-size: 1.2rem; border-bottom: 2px solid #eee; padding-bottom: 10px; }
+    .row { display: flex; gap: 15px; align-items: center; flex-wrap: wrap; margin-bottom: 15px; }
+    label { font-weight: bold; font-size: 0.9rem; }
+    input[type="text"], select { padding: 6px; border: 1px solid #ccc; border-radius: 4px; }
+    button { padding: 8px 15px; background-color: #0078D7; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold; }
+    button:hover { background-color: #005A9E; }
+    button:disabled { background-color: #aaa; cursor: not-allowed; }
+    .btn-alt { background-color: #5c6bc0; }
+    .btn-alt:hover { background-color: #3f51b5; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; font-family: monospace; font-size: 0.95rem; }
+    th, td { padding: 10px; border-bottom: 1px solid #ddd; text-align: left; }
+    th { background-color: #eee; }
+    .data-bytes { word-break: break-all; color: #005A9E; }
+    .count { font-weight: bold; color: #d9534f; }
+  </style>
+</head>
+<body>
+
+  <div class="panel">
+    <h2>1. Connexion Matérielle & Options</h2>
+    <div class="row">
+      <button id="btn-connect">🔌 Connecter l'Adaptateur USB</button>
+      <button id="btn-fullscreen" class="btn-alt">📺 Plein Écran</button>
+      <span id="status" style="font-weight: bold; color: orange;">Non connecté</span>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>2. Créer un Message CAN</h2>
+    <div class="row">
+      <label><input type="checkbox" id="chk-fd"> Format CAN FD</label>
+      <label><input type="checkbox" id="chk-ext"> Extended ID</label>
+      <label>ID (Hex): <input type="text" id="in-id" size="8" maxlength="8" value="123"></label>
+      
+      <label>DLC: 
+        <select id="in-dlc">
+          <option value="0">0 (0 bytes)</option>
+          <option value="1">1 (1 byte)</option>
+          <option value="2">2 (2 bytes)</option>
+          <option value="3">3 (3 bytes)</option>
+          <option value="4">4 (4 bytes)</option>
+          <option value="5">5 (5 bytes)</option>
+          <option value="6">6 (6 bytes)</option>
+          <option value="7">7 (7 bytes)</option>
+          <option value="8" selected>8 (8 bytes)</option>
+          <option value="9">9 (12 bytes)</option>
+          <option value="10">10 (16 bytes)</option>
+          <option value="11">11 (20 bytes)</option>
+          <option value="12">12 (24 bytes)</option>
+          <option value="13">13 (32 bytes)</option>
+          <option value="14">14 (48 bytes)</option>
+          <option value="15">15 (64 bytes)</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <label>Data (Hex) :</label>
+      <input type="text" id="in-data" style="flex-grow: 1;" value="11 22 33 44">
+      <button id="btn-send" disabled>Envoyer Message</button>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>3. Réception (Fixed Trace)</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>ID (Hex)</th>
+          <th>Type</th>
+          <th>Mode</th>
+          <th>DLC</th>
+          <th>Data (Hex)</th>
+          <th>Count</th>
+        </tr>
+      </thead>
+      <tbody id="trace-body"></tbody>
+    </table>
+  </div>
+
+  <script>
+    let port;
+    let writer;
+    const fixedTrace = {};
+
+    const btnConnect = document.getElementById("btn-connect");
+    const btnFullscreen = document.getElementById("btn-fullscreen");
+    const btnSend = document.getElementById("btn-send");
+    const statusEl = document.getElementById("status");
+    const traceBody = document.getElementById("trace-body");
+
+    const chkFd = document.getElementById("chk-fd");
+    const chkExt = document.getElementById("chk-ext");
+    const inId = document.getElementById("in-id");
+    const inDlc = document.getElementById("in-dlc");
+    const inData = document.getElementById("in-data");
+
+    // --- ENREGISTREMENT DU SERVICE WORKER (POUR LE MODE HORS-LIGNE) ---
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js')
+          .then(reg => console.log('Service Worker enregistré !', reg.scope))
+          .catch(err => console.log('Échec enregistrement SW:', err));
+      });
+    }
+
+    // --- GESTION DU PLEIN ÉCRAN ---
+    btnFullscreen.addEventListener("click", () => {
+      if (!document.fullscreenElement) {
+        document.documentElement.requestFullscreen()
+          .then(() => { btnFullscreen.textContent = "❌ Quitter Plein Écran"; })
+          .catch(err => alert(`Erreur plein écran: ${err.message}`));
+      } else {
+        document.exitFullscreen();
+        btnFullscreen.textContent = "📺 Plein Écran";
+      }
+    });
+
+    // --- CONNEXION SERIAL ---
+    btnConnect.addEventListener("click", async () => {
+      if (!("serial" in navigator)) {
+        alert("Votre navigateur ne supporte pas la Web Serial API. Utilisez Google Chrome sur PC/Android.");
+        return;
+      }
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 }); // Doit correspondre au dsPIC
+        writer = port.writable.getWriter();
+        
+        statusEl.textContent = "Connecté !";
+        statusEl.style.color = "green";
+        btnSend.disabled = false;
+        btnConnect.disabled = true;
+        readLoop();
+      } catch (e) {
+        statusEl.textContent = "Échec : " + e.message;
+        statusEl.style.color = "red";
+      }
+    });
+
+    // --- EMISSION ---
+    btnSend.addEventListener("click", async () => {
+      if (!writer) return;
+      let idVal = parseInt(inId.value, 16) || 0;
+      if (!chkExt.checked && idVal > 0x7FF) {
+        alert("En mode Standard, l'ID ne peut pas dépasser 7FF (Hex).");
+        return;
+      }
+      const dlcVal = parseInt(inDlc.value);
+      const isFdVal = chkFd.checked;
+      const dataStr = inData.value.replace(/[^a-fA-F0-9]/g, '');
+      let dataBytes = [];
+      for (let i = 0; i < dataStr.length; i += 2) {
+        dataBytes.push(parseInt(dataStr.substring(i, i + 2), 16));
+      }
+
+      const flags = isFdVal ? 0x01 : 0x00;
+      let frame = [0xAA, (idVal >> 24) & 0xFF, (idVal >> 16) & 0xFF, (idVal >> 8) & 0xFF, idVal & 0xFF, flags, dlcVal];
+      frame = frame.concat(dataBytes);
+      frame.push(0x55);
+
+      try {
+        await writer.write(new Uint8Array(frame));
+      } catch (e) { alert("Erreur d'envoi: " + e.message); }
+    });
+
+    // --- RECEPTION ---
+    async function readLoop() {
+      let reader;
+      try {
+        reader = port.readable.getReader();
+        let state = 0; let rxId = 0; let rxFlags = 0; let rxDlc = 0; let rxData = []; let byteCount = 0;
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          for (let i = 0; i < value.length; i++) {
+            let b = value[i];
+            switch (state) {
+              case 0: if (b === 0xAA) { state = 1; rxId = 0; byteCount = 0; } break;
+              case 1: rxId = (rxId << 8) | b; byteCount++; if (byteCount === 4) state = 2; break;
+              case 2: rxFlags = b; state = 3; break;
+              case 3: rxDlc = b; rxData = [];
+                      let size = [0,1,2,3,4,5,6,7,8,12,16,20,24,32,48,64][rxDlc] || 64;
+                      if (size > 0) { state = 4; byteCount = size; } else { state = 5; } break;
+              case 4: rxData.push(b); byteCount--; if (byteCount === 0) state = 5; break;
+              case 5: if (b === 0x55) handleReceivedMsg(rxId, rxFlags, rxDlc, rxData); state = 0; break;
+            }
+          }
+        }
+      } catch (e) { console.error(e); } finally { if (reader) reader.releaseLock(); }
+    }
+
+    function handleReceivedMsg(id, flags, dlc, data) {
+      const idKey = id.toString(16).toUpperCase().padStart(3, '0');
+      const dataHexStr = data.map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(" ");
+      const isFd = (flags & 0x01) !== 0;
+
+      if (fixedTrace[idKey]) {
+        fixedTrace[idKey].count++; fixedTrace[idKey].dlc = dlc; fixedTrace[idKey].data = dataHexStr; fixedTrace[idKey].mode = isFd ? "FD" : "2.0";
+      } else {
+        fixedTrace[idKey] = { idStr: idKey, isExt: id > 0x7FF ? "EXT" : "STD", mode: isFd ? "FD" : "2.0", dlc: dlc, data: dataHexStr, count: 1 };
+      }
+      renderTrace();
+    }
+
+    function renderTrace() {
+      traceBody.innerHTML = "";
+      Object.keys(fixedTrace).sort().forEach(id => {
+        const item = fixedTrace[id];
+        const tr = document.createElement("tr");
+        tr.innerHTML = `<td><strong>0x${item.idStr}</strong></td><td>${item.isExt}</td><td><span style="color: ${item.mode === 'FD' ? '#0078D7' : '#555'}"><strong>${item.mode}</strong></span></td><td>${item.dlc}</td><td class="data-bytes">${item.data}</td><td class="count">${item.count}</td>`;
+        traceBody.appendChild(tr);
+      });
+    }
+  </script>
+</body>
+</html>
